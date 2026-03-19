@@ -1,0 +1,14 @@
+**INA219 (Current Sensor):**
+SDA connects to GPIO 21 for I2C data communication, and SCL connects to GPIO 22 for the I2C clock line. VCC is connected to 3.3V to power the logic, while GND goes to the common ground. Vin+ is connected to the 12V source, and Vin- is connected to the motor’s positive terminal, placing the sensor in series with the motor to measure current.
+
+**BMP280 (Temperature & Pressure Sensor):**
+SDA connects to GPIO 21 and SCL to GPIO 22, sharing the same I2C bus as the INA219. VCC is typically connected to 3.3V (verify your module supports this voltage), and GND connects to the common ground.
+
+**MQ-135 (Air Quality Sensor):**
+VCC connects to VIN (5V) because the sensor requires 5V for its internal heater coil. GND goes to the common ground. The analog output A0 connects to GPIO 34, and a voltage divider is required to safely interface the signal with the microcontroller.
+
+MQ-135 Analog Output (A0) to GPIO 34 with Voltage Divider:
+Connect the MQ-135 A0 (analog output) pin to Leg 1 of the first 4.6k resistor. Then connect Leg 2 of this first resistor to GPIO 34. From that same GPIO 34 connection point (same row on the breadboard), connect Leg 1 of the second 4.6k resistor. Finally, connect Leg 2 of the second resistor to GND. This forms a voltage divider to safely reduce the sensor’s output voltage before it reaches the GPIO pin.
+
+Visual Map:
+[MQ-135 A0] ---- [4.6k Resistor] ---- [GPIO 34] ---- [4.6k Resistor] ---- [GND]
