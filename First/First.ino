@@ -4,14 +4,12 @@
 #include <Adafruit_INA219.h>
 #include <Adafruit_BME280.h>
 #include <ArduinoJson.h>
+#include <passwd.h>
 
 // ==========================================
 // --- CONFIGURATION ---
 // ==========================================
-const char* ssid = " ";               
-const char* password = " ";        
-const char* mqtt_server = " "; 
-const char* mqtt_topic = "telemetry/room1/sensors";
+
 
 // --- PINS ---
 #define PIN_SDA 21
@@ -200,95 +198,130 @@ void taskSensorsCode(void * parameter) {
 }
 
 // ==========================================
-// --- CORE 0: WIFI, MQTT & LED LOGIC ---
+// --- CORE 0: WIFI, MQTT & LED LOGIC (REPAIRED) ---
 // ==========================================
 void taskCommsCode(void * parameter) {
+  Serial.println("Core 0 Initialized. Waiting 2 seconds before starting network...");
+  vTaskDelay(2000 / portTICK_PERIOD_MS); // Give Core 1 and sensors time to stabilize
+
   WiFi.mode(WIFI_STA);
   client.setServer(mqtt_server, 1883);
+  client.setBufferSize(1024); // Increase buffer size to handle large JSON
   
   unsigned long lastPublish = 0;
-  bool is_connecting_wifi = false;
 
   for(;;) {
-    bool has_fault = false;
-    bool is_tripped = false;
-    if (xSemaphoreTake(dataMutex, 10) == pdTRUE) {
-      // NEW: Added ntc_ok to the fault logic
-      has_fault = (!sharedData.ina_ok || !sharedData.bme_ok || !sharedData.mq_ok || !sharedData.ntc_ok);
-      is_tripped = sharedData.is_tripped;
-      xSemaphoreGive(dataMutex);
+    // --- 1. WIFI CONNECTION MANAGEMENT ---
+    if (WiFi.status() != WL_CONNECTED) {
+      digitalWrite(PIN_LED_GREEN, millis() % 1000 < 500); // Slow blink
+      Serial.println("WiFi Disconnected. Attempting a clean reconnect...");
+      
+      WiFi.disconnect(true); // Force clear old session
+      vTaskDelay(100 / portTICK_PERIOD_MS);
+      WiFi.begin(ssid, password);
+      
+      int attempts = 0;
+      while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+        Serial.print(".");
+        attempts++;
+      }
+
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nWiFi Re-established!");
+        Serial.print("New IP: ");
+        Serial.println(WiFi.localIP());
+      } else {
+        Serial.println("\nWiFi connection attempt failed.");
+        vTaskDelay(5000 / portTICK_PERIOD_MS); // Wait 5 seconds before trying again
+        continue; // Skip the rest of the loop
+      }
     }
 
-    digitalWrite(PIN_LED_TRIP, is_tripped ? HIGH : LOW);
-    digitalWrite(PIN_LED_RED, (has_fault && !is_tripped) ? HIGH : LOW);
-
-    if (WiFi.status() != WL_CONNECTED) {
-      digitalWrite(PIN_LED_GREEN, millis() % 1000 < 500); 
-      if (!is_connecting_wifi) {
-        WiFi.disconnect();
-        delay(100);
-        WiFi.begin(ssid, password);
-        is_connecting_wifi = true;
+    // --- 2. MQTT CONNECTION MANAGEMENT ---
+    if (!client.connected()) {
+      digitalWrite(PIN_LED_GREEN, millis() % 200 < 100); // Fast blink
+      Serial.print("Connecting to MQTT broker... ");
+      
+      // Connecting without password to ensure no Mosquitto block
+      if (client.connect("CentralSensorNode_01")) { 
+        Serial.println("CONNECTED!");
+      } else {
+        Serial.print("FAILED, rc=");
+        Serial.println(client.state());
+        vTaskDelay(3000 / portTICK_PERIOD_MS); // Wait before retrying MQTT
       }
-    } 
-    else {
-      is_connecting_wifi = false; 
-      if (!client.connected()) {
-        digitalWrite(PIN_LED_GREEN, millis() % 200 < 100); 
-        if (client.connect("CentralSensorNode_01", "esp32_device", "esp32pass")) { 
-          // Connected! (Using the credentials from your Linux setup)
-        } else {
-          vTaskDelay(3000 / portTICK_PERIOD_MS); 
-        }
-      } 
-      else {
-        digitalWrite(PIN_LED_GREEN, HIGH); 
-        client.loop(); 
+    }
+
+    // --- 3. MAIN LOOP (PUBLISHING DATA) ---
+    if (client.connected()) {
+        digitalWrite(PIN_LED_GREEN, HIGH); // Solid Green
+        client.loop(); // Keep MQTT alive
         
         if (millis() - lastPublish > 1000) {
-          lastPublish = millis();
-          
-          if (xSemaphoreTake(dataMutex, 100) == pdTRUE) {
-            if (sharedData.updated) {
-              
-              StaticJsonDocument<512> doc;
-              doc["node_id"] = "hvac_monitor_01";
-              doc["uptime_s"] = millis() / 1000;
+            lastPublish = millis();
+            
+            bool has_fault = false;
+            bool is_tripped = false;
+            
+            if (xSemaphoreTake(dataMutex, 100) == pdTRUE) {
+              if (sharedData.updated) {
+                
+                // Get fault status safely
+                has_fault = (!sharedData.ina_ok || !sharedData.bme_ok || !sharedData.mq_ok || !sharedData.ntc_ok);
+                is_tripped = sharedData.is_tripped;
 
-              JsonObject health = doc.createNestedObject("health");
-              health["ina219"] = sharedData.ina_ok;
-              health["bme280"] = sharedData.bme_ok;
-              health["mq135"]  = sharedData.mq_ok;
-              health["ntc"]    = sharedData.ntc_ok; // Added to payload
-              health["trip_status"] = sharedData.is_tripped;
-              
-              if (sharedData.is_tripped) health["sys_status"] = "TRIPPED";
-              else if (has_fault)        health["sys_status"] = "DEGRADED";
-              else                       health["sys_status"] = "OPTIMAL";
+                StaticJsonDocument<512> doc;
+                doc["node_id"] = "hvac_monitor_01";
+                doc["uptime_s"] = millis() / 1000;
 
-              JsonObject data = doc.createNestedObject("data");
-              data["motor_mA"]   = sharedData.current_mA;
-              data["motor_temp_C"] = sharedData.motor_temp_c; // Added to payload
-              data["env_temp_C"] = sharedData.env_temp_c;
-              data["env_hum_RH"] = sharedData.humidity_rh;
-              data["env_pres_hPa"]= sharedData.pressure_hPa;
-              data["air_qual_raw"]= sharedData.mq135_raw;
-              data["air_qual_V"]  = sharedData.mq135_volts;
+                JsonObject health = doc.createNestedObject("health");
+                health["ina219"] = sharedData.ina_ok;
+                health["bme280"] = sharedData.bme_ok;
+                health["mq135"]  = sharedData.mq_ok;
+                health["ntc"]    = sharedData.ntc_ok;
+                health["trip_status"] = is_tripped;
+                
+                if (is_tripped) health["sys_status"] = "TRIPPED";
+                else if (has_fault) health["sys_status"] = "DEGRADED";
+                else health["sys_status"] = "OPTIMAL";
 
-              sharedData.updated = false;
-              xSemaphoreGive(dataMutex);
+                JsonObject data = doc.createNestedObject("data");
+                data["motor_mA"]   = sharedData.current_mA;
+                data["motor_temp_C"] = sharedData.motor_temp_c;
+                data["env_temp_C"] = sharedData.env_temp_c;
+                data["env_hum_RH"] = sharedData.humidity_rh;
+                data["env_pres_hPa"]= sharedData.pressure_hPa;
+                data["air_qual_raw"]= sharedData.mq135_raw;
+                data["air_qual_V"]  = sharedData.mq135_volts;
 
-              char buffer[512];
-              serializeJson(doc, buffer);
-              client.publish(mqtt_topic, buffer);
-              Serial.println(buffer);
-            } else {
-              xSemaphoreGive(dataMutex);
+                sharedData.updated = false;
+                xSemaphoreGive(dataMutex); // Unlock quickly
+
+                char buffer[512];
+                serializeJson(doc, buffer);
+                client.publish(mqtt_topic, buffer);
+                
+                // PRINT TO SERIAL MONITOR SO WE CAN SEE IT!
+                Serial.println(buffer); 
+
+              } else {
+                xSemaphoreGive(dataMutex);
+              }
             }
-          }
         }
-      }
     }
+
+    // --- 4. LED & YIELD ---
+    bool local_has_fault = false, local_is_tripped = false;
+    if (xSemaphoreTake(dataMutex, 10) == pdTRUE) {
+        local_has_fault = (!sharedData.ina_ok || !sharedData.bme_ok || !sharedData.mq_ok || !sharedData.ntc_ok);
+        local_is_tripped = sharedData.is_tripped;
+        xSemaphoreGive(dataMutex);
+    }
+    digitalWrite(PIN_LED_TRIP, local_is_tripped ? HIGH : LOW);
+    digitalWrite(PIN_LED_RED, (local_has_fault && !local_is_tripped) ? HIGH : LOW);
+    
     vTaskDelay(50 / portTICK_PERIOD_MS); 
   }
 }
