@@ -5,7 +5,14 @@
 #include <Adafruit_BME280.h>
 #include <ArduinoJson.h>
 
+// ==========================================
+// --- CONFIGURATION ---
+// ==========================================
+#include "passwd.h"
 
+// SECURED MQTT CREDENTIALS 
+const char* mqtt_user = "hvac_admin";
+const char* mqtt_pass = "iot_secure_123";
 
 // --- PINS ---
 #define PIN_SDA 21
@@ -26,6 +33,10 @@
 #define NTC_NOMINAL_RESIST  10000.0 
 #define NTC_NOMINAL_TEMP    25.0    
 #define NTC_B_COEFFICIENT   3950.0  
+
+// --- THE CALIBRATION OFFSET ---
+// CHANGE THIS NUMBER: If your NTC is reading 10 degrees higher than the BME280, set this to -10.0
+#define NTC_CALIBRATION_OFFSET 10.2 
 
 // ==========================================
 // --- SHARED DATA STRUCTURE & RTOS ---
@@ -149,7 +160,7 @@ void taskSensorsCode(void * parameter) {
     float mq_volts = round2Decimals((mq_raw / 4095.0) * 3.3 * 2.0); 
     bool local_mq_ok = (mq_raw > 20 && mq_raw < 3200);
 
-    // 4. NTC Math
+    // 4. NTC Math with Calibration
     int ntc_raw = analogRead(PIN_NTC);
     if (ntc_raw < 10 || ntc_raw > 4085) {
       local_ntc_ok = false; 
@@ -161,7 +172,9 @@ void taskSensorsCode(void * parameter) {
       steinhart /= NTC_B_COEFFICIENT;                       
       steinhart += 1.0 / (NTC_NOMINAL_TEMP + 273.15);       
       steinhart = 1.0 / steinhart;                          
-      ntc_temp_c = round2Decimals(steinhart - 273.15);      
+      
+      // APPLY THE CALIBRATION OFFSET HERE
+      ntc_temp_c = round2Decimals((steinhart - 273.15) + NTC_CALIBRATION_OFFSET);      
     }
     
     bool tripped_now = (temp_cur > TRIP_CURRENT_mA) || (ntc_temp_c > TRIP_TEMP_C);
@@ -215,10 +228,9 @@ void taskCommsCode(void * parameter) {
       digitalWrite(PIN_LED_GREEN, millis() % 200 < 100); 
       Serial.print("Connecting to Secured MQTT... ");
       
-      // ClientID, Username, Password, WillTopic, WillQoS, WillRetain, WillMessage
       if (client.connect("CentralSensorNode_01", mqtt_user, mqtt_pass, status_topic, 1, true, "offline")) { 
         Serial.println("CONNECTED!");
-        client.publish(status_topic, "online", true); // Send online heartbeat
+        client.publish(status_topic, "online", true); 
       } else {
         Serial.print("FAILED, rc=");
         Serial.println(client.state());
